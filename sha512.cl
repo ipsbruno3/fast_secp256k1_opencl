@@ -1,5 +1,12 @@
-
-
+/*
+ * SHA-512 Implementatiob (OpenCL), unrolled for high throughput.
+ * - 64-bit state in registers (A0..A7) and constants inlined (K literals).
+ * - Uses OpenCL intrinsics: rotate() for ROR and bitselect() for Ch/Maj (branchless).
+ * - Message schedule computed on-the-fly with a rolling window (W16..W32) to avoid W[80] and reduce private memory/register pressure.
+ * - Pure compression: expects `message` already as 16xulong words per block (formatting done by caller).
+ * - sha512_hash_two_blocks_message() compresses exactly 2 blocks; no padding performed here.}
+ * - Author: https://github.com/ipsbruno3
+ */
 
 #define INIT_SHA512(a)                                                         \
   (a)[0] = 0x6a09e667f3bcc908UL;                                               \
