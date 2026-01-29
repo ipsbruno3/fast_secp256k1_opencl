@@ -225,62 +225,53 @@ static inline void point_to_affine_batch64(
     __local ulong *lscan,    // WG*4 (reusado)
     __local ulong *linvTot)  // 4
 {
-  const uint lid = get_local_id(0);
+  const uint lid  = get_local_id(0);
   const uint ridx = (WG - 1u) - lid;
 
-  // z_or1 = (is_inf ? 1 : P->z)
   ulong z_or1[4];
   if (is_inf) fe_one(z_or1); else fe_copy(z_or1, P->z);
 
-  // guarda z original e prepara scan
   fe_store_local(lz,    lid, z_or1);
   fe_store_local(lscan, lid, z_or1);
   barrier(CLK_LOCAL_MEM_FENCE);
 
-  // prefix exclusivo
   blelloch_scan_excl_mul_fe64(lscan);
-
-  ulong prefix[4];
-  fe_load_local(prefix, lscan, lid);
-  fe_store_local(lprefix, lid, prefix);
   barrier(CLK_LOCAL_MEM_FENCE);
 
-  // invTotal = inv(prod Z)
+  // prefix fica em registrador (não precisa lprefix)
+  ulong prefix[4];
+  fe_load_local(prefix, lscan, lid);
+
   if (lid == 0) {
     ulong preLast[4], zLast[4], total[4], invT[4];
-    fe_load_local(preLast, lprefix, WG - 1u); // prod Z[0..62]
-    fe_load_local(zLast,   lz,      WG - 1u); // Z[63] (ou 1)
-    fe_mul(total, preLast, zLast);           // total = prod Z[0..63]
+    fe_load_local(preLast, lscan, WG - 1u); // prod Z[0..62]
+    fe_load_local(zLast,   lz,    WG - 1u); // Z[63] (ou 1)
+    fe_mul(total, preLast, zLast);
     fe_inv(invT, total);
-
-    linvTot[0] = invT[0]; linvTot[1] = invT[1];
-    linvTot[2] = invT[2]; linvTot[3] = invT[3];
+    linvTot[0]=invT[0]; linvTot[1]=invT[1];
+    linvTot[2]=invT[2]; linvTot[3]=invT[3];
   }
   barrier(CLK_LOCAL_MEM_FENCE);
 
-  // prepara scan no vetor reverso (pra suffix exclusivo)
+  // scan reverso
   ulong zrev[4];
-  fe_load_local(zrev, lz, ridx);   // z[WG-1-lid]
+  fe_load_local(zrev, lz, ridx);
   fe_store_local(lscan, lid, zrev);
   barrier(CLK_LOCAL_MEM_FENCE);
 
   blelloch_scan_excl_mul_fe64(lscan);
   barrier(CLK_LOCAL_MEM_FENCE);
 
-  // suffix_excl[i] = rev_prefix_excl[WG-1-i]
   ulong suffix[4];
   fe_load_local(suffix, lscan, ridx);
 
-  // invZ = invTotal * prefix * suffix
   ulong invTotal[4] = { linvTot[0], linvTot[1], linvTot[2], linvTot[3] };
   ulong tmp[4], invZ[4];
   fe_mul(tmp, prefix, suffix);
   fe_mul(invZ, tmp, invTotal);
 
-  // mascara pontos no infinito
   if (is_inf) fe_clear(invZ);
 
-  // ax = X * invZ^2 ; ay = Y * invZ^3
   ulong z2[4], z3[4];
   fe_sqr(z2, invZ);
   fe_mul(z3, z2, invZ);
