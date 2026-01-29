@@ -78,91 +78,384 @@ The implementation focuses on high-performance elliptic curve operations on GPUs
 - **Memory**: Comb table is ~4MB (65536 entries × 64 bytes). Use `cl.mem_flags.READ_ONLY | cl.mem_flags.USE_HOST_PTR` for host-pinned memory (no perf loss) or `cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR` for VRAM copy.
 - **Inputs/Outputs**: Scalars and points are 4x `ulong` (little-endian for points, big-endian for scalars in some ops).
 
-### Step 1: Precompute Comb Table on Host
-Use the provided Python function to build/cache the table. This uses `coincurve` for fast secp256k1 point computation. Run this once; it takes ~10-20 seconds on CPU.
+### Benchmarks
+| Operation | Avg (ms) | Min (ms) | Max (ms) | Std (ms) | Throughput (ops/sec) |
+|----------|----------|----------|----------|----------|----------------------|
+| **point_mul + point_to_affine_batch64** | 108.429 | 107.403 | 109.232 | 0.607 | 92,674,346 |
+| **point_mul only (Jacobian)** | 58.897 | 57.161 | 59.296 | 0.636 | 170,612,123 |
+| **xy64_to_affine (affine individual)** | 105.619 | 105.250 | 106.253 | 0.359 | 95,139,403 |
+| **point_add_64 only (Jacobian)** | 2.686 | 2.682 | 2.690 | 0.003 | 3,741,090,599 |
+| **point_add_64 + point_to_affine_batch64** | 54.517 | 54.435 | 54.627 | 0.059 | 184,318,451 |
+| **point_add_64 + point_to_affine (individual)** | 51.068 | 50.060 | 51.554 | 0.541 | 196,770,393 |
 
-```python
-import coincurve  # pip install coincurve
-import struct
-import numpy as np
-import os
-import time
+**Device:** NVIDIA RTX  5090
 
-N_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-
-def bytes_to_u64_le(b32_be: bytes):
-    return list(struct.unpack("<4Q", b32_be[::-1]))
-
-def scalar_to_point_u64(scalar: int):
-    scalar %= N_ORDER
-    if scalar == 0:
-        return [0]*4, [0]*4
-    pk = coincurve.PrivateKey.from_int(scalar)
-    pt = pk.public_key.format(compressed=False)
-    x_be, y_be = pt[1:33], pt[33:65]
-    return bytes_to_u64_le(x_be), bytes_to_u64_le(y_be)
-
-def build_comb_table_u64(COMB_W=16, cache_dir="cache"):
-    os.makedirs(cache_dir, exist_ok=True)
-    cache_file = os.path.join(cache_dir, f"comb_table_w{COMB_W}.npy")
-    if os.path.exists(cache_file):
-        print(f"[{time.strftime('%H:%M:%S')}] Loading comb table from cache: {cache_file}")
-        start = time.time()
-        table_flat = np.load(cache_file)
-        print(f"[{time.strftime('%H:%M:%S')}] Table loaded in {time.time() - start:.2f}s | shape={table_flat.shape}")
-        return table_flat
-    print(f"[{time.strftime('%H:%M:%S')}] Generating comb table (W={COMB_W})...")
-    start = time.time()
-    TABLE_SIZE = 1 << COMB_W
-    table = np.zeros((TABLE_SIZE, 8), dtype=np.uint64)
-    for i in range(TABLE_SIZE):
-        scalar = 0
-        for w in range(COMB_W):
-            scalar |= ((i >> w) & 1) << (w * 16)
-        x4, y4 = scalar_to_point_u64(scalar)
-        table[i, 0:4] = x4
-        table[i, 4:8] = y4
-    table_flat = np.ascontiguousarray(table.reshape(-1))
-    print(f"[{time.strftime('%H:%M:%S')}] Saving table to cache: {cache_file}")
-    np.save(cache_file, table_flat)
-    print(f"[{time.strftime('%H:%M:%S')}] Table generated and saved in {time.time() - start:.2f}s | shape={table_flat.shape}")
-    return table_flat
-```
-
-### Step 2: Set Up OpenCL on Host
-Use PyOpenCL to create context, queue, and program. Load kernels from your CL files. Allocate the Comb buffer once.
+**Benchmark Code**
 
 ```python
 import pyopencl as cl
 import numpy as np
-import os
+import os, time
+import comb
 
-# Assume CL files in 'kernel' dir
-KERNEL_DIR = 'kernel'
-MATH_CL = os.path.join(KERNEL_DIR, 'math.cl')
-POINT_CL = os.path.join(KERNEL_DIR, 'point.cl')
-DERIVE_CL = os.path.join(KERNEL_DIR, 'derive.cl')
+# -------------------------
+# Config
+# -------------------------
+WG_SIZE   = 64
+NUM_ITEMS = 10_048_576
+NUM_ITEMS -= (NUM_ITEMS % WG_SIZE)
+NUM_RUNS  = 10     # 1 warm-up + 5 medidos
+ADD_ITERS = 1     # aumente (ex: 32/128) se o tempo ficar pequeno demais
 
-# Create context and queue (pick GPU)
+CL_DIR='.'
+MATH_CL   = os.path.join(CL_DIR,'math.cl')
+POINT_CL  = os.path.join(CL_DIR,'point.cl')
+COMMON_CL = os.path.join(CL_DIR,'common.cl')
+
+# -------------------------
+# OpenCL setup
+# -------------------------
 platforms = cl.get_platforms()
-ctx = cl.Context(dev_type=cl.device_type.GPU, properties=[(cl.context_properties.PLATFORM, platforms[0])])
-queue = cl.CommandQueue(ctx)
-
-# Build program (include all CL files)
+devs = platforms[0].get_devices(device_type=cl.device_type.GPU)
+ctx = cl.Context(devices=[devs[0]])
+queue = cl.CommandQueue(ctx, properties=cl.command_queue_properties.PROFILING_ENABLE)
 mf = cl.mem_flags
-with open(MATH_CL, 'r') as f: math_src = f.read()
-with open(POINT_CL, 'r') as f: point_src = f.read()
-with open(DERIVE_CL, 'r') as f: derive_src = f.read()
-full_src = math_src + point_src + derive_src  # Concatenate sources
-prg = cl.Program(ctx, full_src).build(options='-I kernel')  # Include dir for #include
 
-# Precompute and allocate Comb buffer (once)
-table_comb = build_comb_table_u64()
-buf_comb = cl.Buffer(ctx, mf.READ_ONLY | mf.USE_HOST_PTR, hostbuf=table_comb)  # Pinned host mem; or use COPY_HOST_PTR for VRAM
+with open(MATH_CL,'r',encoding='utf-8') as f: math_src=f.read()
+with open(POINT_CL,'r',encoding='utf-8') as f: point_src=f.read()
+with open(COMMON_CL,'r',encoding='utf-8') as f: common_src=f.read()
+
+# -------------------------
+# Extra kernels (wrappers)
+# -------------------------
+bench_kernels = r"""
+
+
+// 1) mul + affine batch
+__kernel __attribute__((reqd_work_group_size(WG,1,1)))
+void k_mul_batch_affine(
+    __global const ulong *k_be,
+    __global ulong *X_out,
+    __global ulong *Y_out,
+    __global const ulong *COMB,
+    __local ulong *lz,
+    __local ulong *lprefix,
+    __local ulong *lscan,
+    __local ulong *linvTot
+){
+    const uint gid = get_global_id(0);
+    ulong kb[4] = { k_be[gid*4+0], k_be[gid*4+1], k_be[gid*4+2], k_be[gid*4+3] };
+
+    ulong k_le[4];
+    scalar_be64_to_le64_4(kb, k_le);
+
+    jac_t R;
+    point_mulG_comb8(&R, k_le, COMB);
+
+    const int inf = point_is_inf(&R);
+    ulong ax[4], ay[4];
+    point_to_affine_batch64(ax, ay, &R, inf, lz, lprefix, lscan, linvTot);
+
+    const uint o = gid*4;
+    X_out[o+0]=ax[0]; X_out[o+1]=ax[1]; X_out[o+2]=ax[2]; X_out[o+3]=ax[3];
+    Y_out[o+0]=ay[0]; Y_out[o+1]=ay[1]; Y_out[o+2]=ay[2]; Y_out[o+3]=ay[3];
+}
+
+// 2) mul only (writes Jacobian X/Y)
+__kernel __attribute__((reqd_work_group_size(WG,1,1)))
+void k_mul_only(
+    __global const ulong *k_be,
+    __global ulong *X_out,
+    __global ulong *Y_out,
+    __global const ulong *COMB
+){
+    const uint gid = get_global_id(0);
+    ulong kb[4] = { k_be[gid*4+0], k_be[gid*4+1], k_be[gid*4+2], k_be[gid*4+3] };
+
+    ulong k_le[4];
+    scalar_be64_to_le64_4(kb, k_le);
+
+    jac_t R;
+    point_mulG_comb8(&R, k_le, COMB);
+
+    const uint o = gid*4;
+    X_out[o+0]=R.x[0]; X_out[o+1]=R.x[1]; X_out[o+2]=R.x[2]; X_out[o+3]=R.x[3];
+    Y_out[o+0]=R.y[0]; Y_out[o+1]=R.y[1]; Y_out[o+2]=R.y[2]; Y_out[o+3]=R.y[3];
+}
+
+// 3) xy64_to_affine (affine individual)
+__kernel __attribute__((reqd_work_group_size(WG,1,1)))
+void k_xy64_to_affine(
+    __global const ulong *k_be,
+    __global ulong *X_out,
+    __global ulong *Y_out,
+    __global const ulong *COMB
+){
+    const uint gid = get_global_id(0);
+    ulong kb[4] = { k_be[gid*4+0], k_be[gid*4+1], k_be[gid*4+2], k_be[gid*4+3] };
+
+    ulong ax[4], ay[4];
+    xy64_to_affine(ax, ay, kb, COMB);
+
+    const uint o = gid*4;
+    X_out[o+0]=ax[0]; X_out[o+1]=ax[1]; X_out[o+2]=ax[2]; X_out[o+3]=ax[3];
+    Y_out[o+0]=ay[0]; Y_out[o+1]=ay[1]; Y_out[o+2]=ay[2]; Y_out[o+3]=ay[3];
+}
+
+// Helpers for add benches: pick 2 affine points from COMB and make Jacobian (z=1)
+static inline void load_affine_from_comb(__private ulong Qx[4], __private ulong Qy[4],
+                                        __global const ulong *COMB, uint idx){
+    const __global ulong *p = COMB + ((size_t)idx << 3);
+    Qx[0]=p[0]; Qx[1]=p[1]; Qx[2]=p[2]; Qx[3]=p[3];
+    Qy[0]=p[4]; Qy[1]=p[5]; Qy[2]=p[6]; Qy[3]=p[7];
+}
+
+// 4) point_add only (Jacobian), does iters adds: A = A + B
+__kernel __attribute__((reqd_work_group_size(WG,1,1)))
+void k_add_only(
+    __global ulong *X_out,
+    __global ulong *Y_out,
+    __global const ulong *COMB,
+    const uint iters
+){
+    const uint gid = get_global_id(0);
+    const uint mask = (COMB_T - 2u);
+    const uint idx1 = (gid & mask) + 1u;
+    const uint idx2 = ((gid * 0x9e3779b9u + 7u) & mask) + 1u;
+
+    ulong Ax[4], Ay[4], Bx[4], By[4];
+    load_affine_from_comb(Ax, Ay, COMB, idx1);
+    load_affine_from_comb(Bx, By, COMB, idx2);
+
+    jac_t A, B, R;
+    point_set_affine(&A, Ax, Ay);
+    point_set_affine(&B, Bx, By);
+
+    for(uint i=0;i<iters;i++){
+        point_add_64(&R, &A, &B);
+        point_copy(&A, &R);
+    }
+
+    const uint o = gid*4;
+    X_out[o+0]=A.x[0]; X_out[o+1]=A.x[1]; X_out[o+2]=A.x[2]; X_out[o+3]=A.x[3];
+    Y_out[o+0]=A.y[0]; Y_out[o+1]=A.y[1]; Y_out[o+2]=A.y[2]; Y_out[o+3]=A.y[3];
+}
+
+// 5) point_add + affine batch
+__kernel __attribute__((reqd_work_group_size(WG,1,1)))
+void k_add_batch_affine(
+    __global ulong *X_out,
+    __global ulong *Y_out,
+    __global const ulong *COMB,
+    const uint iters,
+    __local ulong *lz,
+    __local ulong *lprefix,
+    __local ulong *lscan,
+    __local ulong *linvTot
+){
+    const uint gid = get_global_id(0);
+    const uint mask = (COMB_T - 2u);
+    const uint idx1 = (gid & mask) + 1u;
+    const uint idx2 = ((gid * 0x9e3779b9u + 7u) & mask) + 1u;
+
+    ulong Ax[4], Ay[4], Bx[4], By[4];
+    load_affine_from_comb(Ax, Ay, COMB, idx1);
+    load_affine_from_comb(Bx, By, COMB, idx2);
+
+    jac_t A, B, R;
+    point_set_affine(&A, Ax, Ay);
+    point_set_affine(&B, Bx, By);
+
+    for(uint i=0;i<iters;i++){
+        point_add_64(&R, &A, &B);
+        point_copy(&A, &R);
+    }
+
+    const int inf = point_is_inf(&A);
+    ulong ax[4], ay[4];
+    point_to_affine_batch64(ax, ay, &A, inf, lz, lprefix, lscan, linvTot);
+
+    const uint o = gid*4;
+    X_out[o+0]=ax[0]; X_out[o+1]=ax[1]; X_out[o+2]=ax[2]; X_out[o+3]=ax[3];
+    Y_out[o+0]=ay[0]; Y_out[o+1]=ay[1]; Y_out[o+2]=ay[2]; Y_out[o+3]=ay[3];
+}
+
+// 6) point_add + affine individual
+__kernel __attribute__((reqd_work_group_size(WG,1,1)))
+void k_add_indiv_affine(
+    __global ulong *X_out,
+    __global ulong *Y_out,
+    __global const ulong *COMB,
+    const uint iters
+){
+    const uint gid = get_global_id(0);
+    const uint mask = (COMB_T - 2u);
+    const uint idx1 = (gid & mask) + 1u;
+    const uint idx2 = ((gid * 0x9e3779b9u + 7u) & mask) + 1u;
+
+    ulong Ax[4], Ay[4], Bx[4], By[4];
+    load_affine_from_comb(Ax, Ay, COMB, idx1);
+    load_affine_from_comb(Bx, By, COMB, idx2);
+
+    jac_t A, B, R;
+    point_set_affine(&A, Ax, Ay);
+    point_set_affine(&B, Bx, By);
+
+    for(uint i=0;i<iters;i++){
+        point_add_64(&R, &A, &B);
+        point_copy(&A, &R);
+    }
+
+    ulong ax[4], ay[4];
+    point_to_affine(ax, ay, &A);
+
+    const uint o = gid*4;
+    X_out[o+0]=ax[0]; X_out[o+1]=ax[1]; X_out[o+2]=ax[2]; X_out[o+3]=ax[3];
+    Y_out[o+0]=ay[0]; Y_out[o+1]=ay[1]; Y_out[o+2]=ay[2]; Y_out[o+3]=ay[3];
+}
+"""
+
+full_src = common_src + math_src + point_src + bench_kernels
+prg = cl.Program(ctx, full_src).build(options='-I .')
+
+# -------------------------
+# Buffers
+# -------------------------
+table_comb = comb.build_comb_table_u64()
+buf_comb = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=table_comb)
+
+# random scalars (4x u64 por item)
+rng = np.random.default_rng(12345)
+k_words = rng.integers(0, np.iinfo(np.uint64).max, size=(NUM_ITEMS,4), dtype=np.uint64)
+zmask = np.all(k_words == 0, axis=1)
+k_words[zmask,3] = 1
+k_be_np = np.ascontiguousarray(k_words.reshape(-1))
+buf_k_be = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=k_be_np)
+
+x_out_np = np.empty(NUM_ITEMS*4, dtype=np.uint64)
+y_out_np = np.empty(NUM_ITEMS*4, dtype=np.uint64)
+buf_x_out = cl.Buffer(ctx, mf.WRITE_ONLY, x_out_np.nbytes)
+buf_y_out = cl.Buffer(ctx, mf.WRITE_ONLY, y_out_np.nbytes)
+
+# local mem (batch affine)
+local_size_bytes = WG_SIZE * 4 * 8   # WG * 4 ulongs * 8B
+linvTot_size     = 4 * 8
+
+# -------------------------
+# Bench helper
+# -------------------------
+kernels = {
+    "k_mul_batch_affine": cl.Kernel(prg, "k_mul_batch_affine"),
+    "k_mul_only":         cl.Kernel(prg, "k_mul_only"),
+    "k_xy64_to_affine":   cl.Kernel(prg, "k_xy64_to_affine"),  # <<< FIX
+    "k_add_only":         cl.Kernel(prg, "k_add_only"),
+    "k_add_batch_affine": cl.Kernel(prg, "k_add_batch_affine"),
+    "k_add_indiv_affine": cl.Kernel(prg, "k_add_indiv_affine"),
+}
+
+
+def run_bench(title, k: cl.Kernel, gsz, lsz, args, ops_per_item=1):
+    times = []
+    for r in range(NUM_RUNS):
+        # seta args (evita overhead de __call__ e evita retrieval)
+        k.set_args(*args)
+
+        evt = cl.enqueue_nd_range_kernel(queue, k, gsz, lsz)
+        evt.wait()
+
+        ms = (evt.profile.end - evt.profile.start) * 1e-6
+        times.append(ms)
+
+    meas = np.array(times[1:], dtype=np.float64)  # drop warm-up
+    ops = NUM_ITEMS * ops_per_item
+    thr = ops / (meas.mean() / 1000.0)
+
+    print(f"\n=== {title} ===")
+    print(f"Avg: {meas.mean():.3f} ms | Min: {meas.min():.3f} | Max: {meas.max():.3f} | Std: {meas.std():.3f}")
+    print(f"Throughput: {thr:,.0f} ops/sec")
+
+
+# -------------------------
+# Run benches
+# -------------------------
+print(f"Device: {devs[0].name}")
+print(f"NUM_ITEMS={NUM_ITEMS} WG={WG_SIZE} groups={NUM_ITEMS//WG_SIZE} runs={NUM_RUNS} (1 warm-up)")
+print(f"ADD_ITERS={ADD_ITERS}")
+
+gsz = (NUM_ITEMS,)
+lsz = (WG_SIZE,)
+
+# 1) mul + affine batch
+run_bench(
+    "1) point_mul + point_to_affine_batch64",
+    kernels["k_mul_batch_affine"],
+    gsz, lsz,
+    (
+        buf_k_be, buf_x_out, buf_y_out, buf_comb,
+        cl.LocalMemory(local_size_bytes),
+        cl.LocalMemory(local_size_bytes),
+        cl.LocalMemory(local_size_bytes),
+        cl.LocalMemory(linvTot_size),
+    ),
+    ops_per_item=1
+)
+
+# 2) mul only
+run_bench(
+    "2) point_mul only (Jacobian)",
+    kernels["k_mul_only"],
+    gsz, lsz,
+    (buf_k_be, buf_x_out, buf_y_out, buf_comb),
+    ops_per_item=1
+)
+
+# 3) xy64_to_affine (individual affine)
+run_bench(
+    "3) xy64_to_affine (affine individual)",
+    kernels["k_xy64_to_affine"],  # <<< FIX
+    gsz, lsz,
+    (buf_k_be, buf_x_out, buf_y_out, buf_comb),
+    ops_per_item=1
+)
+
+
+# 4) point_add only
+run_bench(
+    "4) point_add_64 only (Jacobian)",
+    kernels["k_add_only"],
+    gsz, lsz,
+    (buf_x_out, buf_y_out, buf_comb, np.uint32(ADD_ITERS)),
+    ops_per_item=ADD_ITERS
+)
+
+# 5) point_add + affine batch
+run_bench(
+    "5) point_add_64 + point_to_affine_batch64",
+    kernels["k_add_batch_affine"],
+    gsz, lsz,
+    (
+        buf_x_out, buf_y_out, buf_comb, np.uint32(ADD_ITERS),
+        cl.LocalMemory(local_size_bytes),
+        cl.LocalMemory(local_size_bytes),
+        cl.LocalMemory(local_size_bytes),
+        cl.LocalMemory(linvTot_size),
+    ),
+    ops_per_item=ADD_ITERS
+)
+
+# 6) point_add + affine individual
+run_bench(
+    "6) point_add_64 + point_to_affine (individual)",
+    kernels["k_add_indiv_affine"],
+    gsz, lsz,
+    (buf_x_out, buf_y_out, buf_comb, np.uint32(ADD_ITERS)),
+    ops_per_item=ADD_ITERS
+)
 ```
 
-### Step 3: Call Kernel
-To invoke the derivation, use a kernel entry point that sets up variables and calls the derivation sequence.
+
+### Step 2: Derive BIP-84
+Example to invoke the derivation, use a kernel entry point that sets up variables and calls the derivation sequence.
 
 ```opencl
 ulong index  = 0;
@@ -218,9 +511,8 @@ pub_affine_batch64(X64, Y64, k_out, COMB, lz, lprefix, lscan, linvTot);
 ## Building / Integration
 This repo is primarily OpenCL kernel code. Typical integration steps:
 1. Concatenate / include the `.cl` files in your host program.
-2. Build the OpenCL program with your target options (see tuning notes below).
-3. Allocate buffers for: input scalars / chain codes / intermediate states; comb precomputed table buffer; output points / derived keys.
-4. Dispatch kernels with a tuned global/local size.
+2. Allocate buffers for: input scalars / chain codes / intermediate states; comb precomputed table buffer; output points / derived keys.
+3. Dispatch kernels with a tuned global/local size.
 
 
 
