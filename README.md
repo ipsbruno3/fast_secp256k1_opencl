@@ -79,16 +79,18 @@ The implementation focuses on high-performance elliptic curve operations on GPUs
 - **Inputs/Outputs**: Scalars and points are 4x `ulong` (little-endian for points, big-endian for scalars in some ops).
 
 ### Benchmarks
-| Operation | Avg (ms) | Min (ms) | Max (ms) | Std (ms) | Throughput (ops/sec) |
-|----------|----------|----------|----------|----------|----------------------|
-| **point_mul + point_to_affine_batch64** | 108.429 | 107.403 | 109.232 | 0.607 | 92,674,346 |
-| **point_mul only (Jacobian)** | 58.897 | 57.161 | 59.296 | 0.636 | 170,612,123 |
-| **xy64_to_affine (affine individual)** | 105.619 | 105.250 | 106.253 | 0.359 | 95,139,403 |
-| **point_add_64 only (Jacobian)** | 2.686 | 2.682 | 2.690 | 0.003 | 3,741,090,599 |
-| **point_add_64 + point_to_affine_batch64** | 54.517 | 54.435 | 54.627 | 0.059 | 184,318,451 |
-| **point_add_64 + point_to_affine (individual)** | 51.068 | 50.060 | 51.554 | 0.541 | 196,770,393 |
+| Operation                          | Avg Time (ms) | Min Time (ms) | Max Time (ms) | Std Dev (ms) | Throughput (ops/sec) |
+|------------------------------------|---------------|---------------|---------------|--------------|-----------------------|
+| 1) Comb Mul + Batch Affine (point_to_affine_batch64) | 108.23       | 107.49       | 109.28       | 0.57        | 92,843,625           |
+| 2) Comb Mul Only (Jacobian Output) | 58.82        | 56.99        | 59.30        | 0.68        | 170,824,684          |
+| 3) Comb Mul + Individual Affine (xy64_to_affine) | 105.57       | 105.04       | 106.01       | 0.26        | 95,188,408           |
+| 4) Point Add Only (point_add_64, Jacobian) | 169.53       | 169.49       | 169.61       | 0.04        | 3,793,515,429        |
+| 5) Point Add + Batch Affine (point_add_64 + point_to_affine_batch64) | 224.74       | 224.11       | 225.29       | 0.32        | 2,861,534,456        |
+| 6) Point Add + Individual Affine (point_add_64 + point_to_affine) | 230.76       | 230.15       | 231.04       | 0.26        | 2,786,943,993        |
 
-**Device:** NVIDIA RTX  5090
+### Device Info
+- Device: NVIDIA GeForce RTX 5090
+- Config: NUM_ITEMS=10048576; WG=64; Groups=157009; Runs=10 (1 warm-up); ADD_ITERS=64
 
 **Benchmark Code**
 
@@ -105,7 +107,7 @@ WG_SIZE   = 64
 NUM_ITEMS = 10_048_576
 NUM_ITEMS -= (NUM_ITEMS % WG_SIZE)
 NUM_RUNS  = 10     # 1 warm-up + 5 medidos
-ADD_ITERS = 1     # aumente (ex: 32/128) se o tempo ficar pequeno demais
+ADD_ITERS = 64     # aumente (ex: 32/128) se o tempo ficar pequeno demais
 
 CL_DIR='.'
 MATH_CL   = os.path.join(CL_DIR,'math.cl')
@@ -313,6 +315,144 @@ void k_add_indiv_affine(
     X_out[o+0]=ax[0]; X_out[o+1]=ax[1]; X_out[o+2]=ax[2]; X_out[o+3]=ax[3];
     Y_out[o+0]=ay[0]; Y_out[o+1]=ay[1]; Y_out[o+2]=ay[2]; Y_out[o+3]=ay[3];
 }
+"""
+
+full_src = common_src + math_src + point_src + bench_kernels
+prg = cl.Program(ctx, full_src).build(options='-I .')
+
+# -------------------------
+# Buffers
+# -------------------------
+table_comb = comb.build_comb_table_u64()
+buf_comb = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=table_comb)
+
+# random scalars (4x u64 por item)
+rng = np.random.default_rng(12345)
+k_words = rng.integers(0, np.iinfo(np.uint64).max, size=(NUM_ITEMS,4), dtype=np.uint64)
+zmask = np.all(k_words == 0, axis=1)
+k_words[zmask,3] = 1
+k_be_np = np.ascontiguousarray(k_words.reshape(-1))
+buf_k_be = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=k_be_np)
+
+x_out_np = np.empty(NUM_ITEMS*4, dtype=np.uint64)
+y_out_np = np.empty(NUM_ITEMS*4, dtype=np.uint64)
+buf_x_out = cl.Buffer(ctx, mf.WRITE_ONLY, x_out_np.nbytes)
+buf_y_out = cl.Buffer(ctx, mf.WRITE_ONLY, y_out_np.nbytes)
+
+# local mem (batch affine)
+local_size_bytes = WG_SIZE * 4 * 8   # WG * 4 ulongs * 8B
+linvTot_size     = 4 * 8
+
+# -------------------------
+# Bench helper
+# -------------------------
+kernels = {
+    "k_mul_batch_affine": cl.Kernel(prg, "k_mul_batch_affine"),
+    "k_mul_only":         cl.Kernel(prg, "k_mul_only"),
+    "k_xy64_to_affine":   cl.Kernel(prg, "k_xy64_to_affine"),  # <<< FIX
+    "k_add_only":         cl.Kernel(prg, "k_add_only"),
+    "k_add_batch_affine": cl.Kernel(prg, "k_add_batch_affine"),
+    "k_add_indiv_affine": cl.Kernel(prg, "k_add_indiv_affine"),
+}
+
+
+def run_bench(title, k: cl.Kernel, gsz, lsz, args, ops_per_item=1):
+    times = []
+    for r in range(NUM_RUNS):
+        # seta args (evita overhead de __call__ e evita retrieval)
+        k.set_args(*args)
+
+        evt = cl.enqueue_nd_range_kernel(queue, k, gsz, lsz)
+        evt.wait()
+
+        ms = (evt.profile.end - evt.profile.start) * 1e-6
+        times.append(ms)
+
+    meas = np.array(times[1:], dtype=np.float64)  # drop warm-up
+    ops = NUM_ITEMS * ops_per_item
+    thr = ops / (meas.mean() / 1000.0)
+
+    print(f"\n=== {title} ===")
+    print(f"Avg: {meas.mean():.3f} ms | Min: {meas.min():.3f} | Max: {meas.max():.3f} | Std: {meas.std():.3f}")
+    print(f"Throughput: {thr:,.0f} ops/sec")
+
+
+# -------------------------
+# Run benches
+# -------------------------
+print(f"Device: {devs[0].name}")
+print(f"NUM_ITEMS={NUM_ITEMS} WG={WG_SIZE} groups={NUM_ITEMS//WG_SIZE} runs={NUM_RUNS} (1 warm-up)")
+print(f"ADD_ITERS={ADD_ITERS}")
+
+gsz = (NUM_ITEMS,)
+lsz = (WG_SIZE,)
+
+# 1) mul + affine batch
+run_bench(
+    "1) point_mul + point_to_affine_batch64",
+    kernels["k_mul_batch_affine"],
+    gsz, lsz,
+    (
+        buf_k_be, buf_x_out, buf_y_out, buf_comb,
+        cl.LocalMemory(local_size_bytes),
+        cl.LocalMemory(local_size_bytes),
+        cl.LocalMemory(local_size_bytes),
+        cl.LocalMemory(linvTot_size),
+    ),
+    ops_per_item=1
+)
+
+# 2) mul only
+run_bench(
+    "2) point_mul only (Jacobian)",
+    kernels["k_mul_only"],
+    gsz, lsz,
+    (buf_k_be, buf_x_out, buf_y_out, buf_comb),
+    ops_per_item=1
+)
+
+# 3) xy64_to_affine (individual affine)
+run_bench(
+    "3) xy64_to_affine (affine individual)",
+    kernels["k_xy64_to_affine"],  # <<< FIX
+    gsz, lsz,
+    (buf_k_be, buf_x_out, buf_y_out, buf_comb),
+    ops_per_item=1
+)
+
+
+# 4) point_add only
+run_bench(
+    "4) point_add_64 only (Jacobian)",
+    kernels["k_add_only"],
+    gsz, lsz,
+    (buf_x_out, buf_y_out, buf_comb, np.uint32(ADD_ITERS)),
+    ops_per_item=ADD_ITERS
+)
+
+# 5) point_add + affine batch
+run_bench(
+    "5) point_add_64 + point_to_affine_batch64",
+    kernels["k_add_batch_affine"],
+    gsz, lsz,
+    (
+        buf_x_out, buf_y_out, buf_comb, np.uint32(ADD_ITERS),
+        cl.LocalMemory(local_size_bytes),
+        cl.LocalMemory(local_size_bytes),
+        cl.LocalMemory(local_size_bytes),
+        cl.LocalMemory(linvTot_size),
+    ),
+    ops_per_item=ADD_ITERS
+)
+
+# 6) point_add + affine individual
+run_bench(
+    "6) point_add_64 + point_to_affine (individual)",
+    kernels["k_add_indiv_affine"],
+    gsz, lsz,
+    (buf_x_out, buf_y_out, buf_comb, np.uint32(ADD_ITERS)),
+    ops_per_item=ADD_ITERS
+)
 """
 
 full_src = common_src + math_src + point_src + bench_kernels
