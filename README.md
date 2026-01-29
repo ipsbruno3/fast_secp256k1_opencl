@@ -65,7 +65,6 @@ Specialized for BIP32 CKD messages (37 bytes). Implements standard HMAC: inner =
 The derivation logic typically follows: hardened derivation uses parent private key material (HMAC input includes 0x00 || k || index); normal derivation uses parent public key material (HMAC input includes serP(point) || index). For BIP84 paths like `m/84'/0'/0'/change/index`: first levels are hardened (no public key required); later levels are normal (public key required); public keys are produced via `k*G` and then used in subsequent derivation steps. The kernels here provide the low-level building blocks; you can integrate them into a full pipeline (address derivation, bloom/tag checks, batching, etc.). Total de multiplicações escalares: apenas 3 (account, change, receive/address index). Todas as pubkeys são calculadas via batch de 64 (mesmo se for só 1 por workgroup → ainda vale pela inversão única).
 
 ## Performance Highlights
-- **GPU Focus**: Branchless where possible; unrolled ops; local mem for scans. Estimated on AMD RX 7900 XTX: scalar mul ~30µs; full BIP84 derivation ~90µs/address; >10M addresses/sec in batch.
 - **Memory**: Comb table ~4MB global; ~6KB local per WG.
 - **Constant-Time**: Critical paths (field ops, SHA) avoid timing leaks.
 
